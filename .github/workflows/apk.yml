@@ -1,0 +1,86 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Find and unpack project
+        run: |
+          if [ ! -f bomb-tag-app/package.json ]; then
+            f=$(find . -iname '*bomb*.zip' -not -path './.git/*' | head -1)
+            [ -z "$f" ] && f=$(find . -iname '*.zip' -not -path './.git/*' | head -1)
+            echo "using: $f"
+            [ -n "$f" ] || { echo 'NO ZIP FOUND'; exit 1; }
+            rm -rf bomb-tag-app
+            unzip -q "$f"
+          fi
+          ls -la bomb-tag-app
+
+      - name: Install Capacitor
+        working-directory: bomb-tag-app
+        run: |
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json'));p.dependencies={'@capacitor/core':'^6.1.0','@capacitor/android':'^6.1.0','@capacitor/splash-screen':'^6.0.0'};p.devDependencies={'@capacitor/cli':'^6.1.0'};fs.writeFileSync('package.json',JSON.stringify(p,null,2))"
+          npm install
+
+      - name: Create Android project
+        working-directory: bomb-tag-app
+        run: npx cap add android
+
+      - name: Icon and splash screen
+        working-directory: bomb-tag-app
+        continue-on-error: true
+        run: npx --yes @capacitor/assets@3 generate --android --iconBackgroundColor '#0f1a13' --splashBackgroundColor '#0f1a13' --splashBackgroundColorDark '#0f1a13'
+
+      - name: Lock to landscape
+        working-directory: bomb-tag-app
+        run: sed -i 's/<activity/<activity android:screenOrientation="sensorLandscape"/' android/app/src/main/AndroidManifest.xml
+
+      - name: Copy web files
+        working-directory: bomb-tag-app
+        run: npx cap sync android
+
+      - name: Get Gradle (several mirrors, with retries)
+        working-directory: bomb-tag-app/android
+        run: |
+          props=gradle/wrapper/gradle-wrapper.properties
+          url=$(grep '^distributionUrl' $props | cut -d= -f2- | tr -d '\\')
+          name=$(basename "$url")
+          ver=$(echo "$name" | sed -E 's/gradle-(.*)-(all|bin)\.zip/\1/')
+          echo "need $name"
+          ok=0
+          for i in 1 2 3 4; do
+            for u in "$url" "https://mirrors.cloud.tencent.com/gradle/$name" "https://github.com/gradle/gradle-distributions/releases/download/v$ver/$name"; do
+              echo "trying $u"
+              if curl -fL --retry 2 --connect-timeout 20 -o "$HOME/$name" "$u" && unzip -tq "$HOME/$name" >/dev/null; then ok=1; break 2; fi
+            done
+            echo 'all failed, waiting 30s'; sleep 30
+          done
+          [ $ok = 1 ] || exit 1
+          sed -i "s|^distributionUrl=.*|distributionUrl=file:$HOME/$name|" $props
+          cat $props
+
+      - name: Build APK
+        working-directory: bomb-tag-app/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bomb-tag-apk
+          path: bomb-tag-app/android/app/build/outputs/apk/debug/app-debug.apk
